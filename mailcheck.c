@@ -4,6 +4,9 @@
 #include <unistd.h>
 #include <err.h>
 #include <limits.h>
+#include <sys/event.h>
+#include <sys/time.h>
+#include <fcntl.h>
 
 #include <json.h>
 
@@ -35,10 +38,13 @@ main(int argc, char **argv)
 	int newmail, i, ch;
 	int position = -1;
 	int comma = 0;
+	int kq, r, lastcheck = 0;
+	struct kevent kev;
 	struct json_object *json;
 	struct json_object *mail;
 	struct json_object *array;
 	struct json_object *nomail;
+	struct timespec timeout = { 0, 0 };
 
 	if (pledge("stdio rpath", NULL) == -1)
 		errx(1, "pledge");
@@ -82,6 +88,12 @@ main(int argc, char **argv)
 	json_object_object_add(nomail, "separator", json_object_new_boolean(FALSE));
 	json_object_object_add(nomail, "color", json_object_new_string("#FFFF00"));
 
+	kq = kqueue();
+	EV_SET(&kev, dirfd(dir), EVFILT_VNODE, EV_ADD, NOTE_WRITE, 0, NULL);
+	if (kevent(kq, &kev, 1, NULL, 0, &timeout) == -1)
+		errx(1, "kevent");
+
+	lastcheck = checkmail(dir);
 
 	while (getline(&buf, &len, stdin) != -1) {
 		comma = 0;
@@ -92,7 +104,17 @@ main(int argc, char **argv)
 		if ((json = json_tokener_parse(buf + comma)) == NULL)
 			errx(1, "json parsing failed");
 
-		if ((newmail = checkmail(dir)) == 0) {
+		r = kevent(kq, NULL, 0, &kev, 1, &timeout);
+		if (r == -1)
+			errx(1, "kevent");
+
+		if (r > 0) {
+			lastcheck = checkmail(dir);
+		}
+
+		newmail = lastcheck;
+
+		if (newmail == 0) {
 			mail = json_object_get(nomail);
 		} else {
 			snprintf(result, sizeof(result), " %i ", newmail);
@@ -104,6 +126,13 @@ main(int argc, char **argv)
 			json_object_object_add(mail, "color", json_object_new_string("#FFFF00"));
 		}
 
+		EV_SET(&kev, dirfd(dir), EVFILT_VNODE, EV_DELETE, NOTE_WRITE, 0, NULL);
+		if (kevent(kq, &kev, 1, NULL, 0, &timeout) == -1)
+			errx(1, "kevent");
+
+		EV_SET(&kev, dirfd(dir), EVFILT_VNODE, EV_ADD, NOTE_WRITE, 0, NULL);
+		if (kevent(kq, &kev, 1, NULL, 0, &timeout) == -1)
+			errx(1, "kevent");
 		array = json_object_new_array();
 
 		for (i = 0; i < json_object_array_length(json); i++) {
